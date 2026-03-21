@@ -1,40 +1,59 @@
 #!/usr/bin/env python3
 """
-🔍 Polymarket Scanner Bot
-Автоматически сканирует рынки и шлёт алерты в Telegram
+🔍 Polymarket — Сканер недооценённых рынков
+============================================
+Логика: сравниваем рыночную цену (что люди готовы платить)
+с реальной статистической вероятностью события.
+Если разница > порога — отправляем алерт в Telegram.
+
+НЕ торгует автоматически — только информирует тебя.
+Решение всегда за тобой.
 """
 
 import requests
 import time
 import json
 import os
-import threading
 from datetime import datetime, timezone
 
 # ============================================================
-# ⚙️  НАСТРОЙКИ (берутся из переменных окружения)
+# ⚙️  НАСТРОЙКИ
 # ============================================================
 
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_TOKEN   = "ТВОЙ_ТОКЕН_БОТА"    # @BotFather
+TELEGRAM_CHAT_ID = "ТВОЙ_CHAT_ID"        # @userinfobot
 
-MIN_EDGE       = float(os.environ.get("MIN_EDGE", "0.08"))       # 8% минимальный edge
-MIN_VOLUME     = float(os.environ.get("MIN_VOLUME", "5000"))     # $5k минимальный объём
-SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL", "600"))     # 10 минут
-MIN_PRICE      = 0.03
-MAX_PRICE      = 0.80
+# Минимальная "недооценённость" чтобы алерт сработал
+# 0.08 = рыночная цена отличается от нашей оценки на 8%+
+MIN_EDGE = 0.08
+
+# Минимальный объём торгов (USDC) — фильтруем мусорные рынки
+MIN_VOLUME = 5_000
+
+# Минимальная ликвидность в стакане
+MIN_LIQUIDITY = 1_000
+
+# Как часто сканировать (секунды)
+SCAN_INTERVAL = 600  # 10 минут
+
+# Максимальная цена контракта (не интересуют уже "дорогие" исходы)
+MAX_PRICE = 0.80
+
+# Минимальная цена (слишком дешёвые — обычно мусор)
+MIN_PRICE = 0.03
+
+# ============================================================
+# 📡 API ENDPOINTS
+# ============================================================
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
 
 # ============================================================
-# 📨 TELEGRAM — отправка сообщений
+# 📨 TELEGRAM
 # ============================================================
 
 def send_telegram(message: str) -> bool:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[TG] Токен или chat_id не заданы!")
-        return False
     url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = {
         "chat_id":                TELEGRAM_CHAT_ID,
@@ -46,76 +65,43 @@ def send_telegram(message: str) -> bool:
         r = requests.post(url, data=data, timeout=10)
         return r.status_code == 200
     except Exception as e:
-        print(f"[TG Error] {e}")
+        print(f"  [TG Error] {e}")
         return False
 
 # ============================================================
-# 📡 TELEGRAM — получение обновлений (polling)
+# 📊 ПОЛУЧИТЬ АКТИВНЫЕ РЫНКИ
 # ============================================================
 
-last_update_id = 0
-
-def get_updates():
-    global last_update_id
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-        params = {"offset": last_update_id + 1, "timeout": 5}
-        r = requests.get(url, params=params, timeout=10)
-        if r.status_code == 200:
-            updates = r.json().get("result", [])
-            for upd in updates:
-                last_update_id = upd["update_id"]
-                handle_command(upd)
-    except Exception:
-        pass
-
-def handle_command(update: dict):
-    """Обрабатываем команды от пользователя"""
-    msg = update.get("message", {})
-    text = msg.get("text", "")
-    chat_id = msg.get("chat", {}).get("id", "")
-
-    if not text or not chat_id:
-        return
-
-    if text == "/start":
-        send_telegram(
-            "👋 <b>Polymarket Scanner Bot</b>\n\n"
-            "Я автоматически ищу недооценённые рынки на Polymarket "
-            "и присылаю тебе алерты.\n\n"
-            f"⚙️ Текущие настройки:\n"
-            f"• Минимальный edge: {MIN_EDGE*100:.0f}%\n"
-            f"• Минимальный объём: ${MIN_VOLUME:,.0f}\n"
-            f"• Интервал сканирования: {SCAN_INTERVAL//60} мин\n\n"
-            "✅ Сканер работает в фоне. Жди алертов!"
-        )
-    elif text == "/status":
-        send_telegram(
-            "✅ <b>Бот работает</b>\n\n"
-            f"🕐 Время: {datetime.now().strftime('%H:%M %d.%m.%Y')}\n"
-            f"⏱️ Интервал сканирования: {SCAN_INTERVAL//60} мин\n"
-            f"📊 Минимальный edge: {MIN_EDGE*100:.0f}%"
-        )
-
-# ============================================================
-# 📊 ПАРСИНГ РЫНКОВ
-# ============================================================
-
-def get_active_markets(limit: int = 150) -> list:
+def get_active_markets(limit: int = 100) -> list:
+    """Получаем активные рынки через Gamma API (публичный, без ключа)"""
     try:
         params = {
-            "active": "true", "closed": "false",
-            "archived": "false", "limit": limit,
-            "order": "volume24hr", "ascending": "false",
+            "active":   "true",
+            "closed":   "false",
+            "archived": "false",
+            "limit":    limit,
+            "order":    "volume24hr",
+            "ascending":"false",
         }
-        r = requests.get(f"{GAMMA_API}/markets", params=params, timeout=15)
-        if r.status_code == 200:
-            return r.json()
+        r = requests.get(
+            f"{GAMMA_API}/markets",
+            params=params,
+            timeout=15
+        )
+        if r.status_code != 200:
+            print(f"  [Gamma API] Статус {r.status_code}")
+            return []
+        return r.json()
     except Exception as e:
-        print(f"[Gamma API Error] {e}")
-    return []
+        print(f"  [Gamma API Error] {e}")
+        return []
 
-def get_clob_price(token_id: str) -> float | None:
+# ============================================================
+# 📈 ПОЛУЧИТЬ ЦЕНУ ИЗ СТАКАНА (CLOB)
+# ============================================================
+
+def get_clob_price(token_id: str) -> dict | None:
+    """Берём реальную рыночную цену из стакана заявок"""
     try:
         r = requests.get(
             f"{CLOB_API}/price",
@@ -123,189 +109,260 @@ def get_clob_price(token_id: str) -> float | None:
             timeout=10
         )
         if r.status_code == 200:
-            return float(r.json().get("price", 0))
+            data = r.json()
+            return {
+                "buy_price":  float(data.get("price", 0)),
+            }
     except Exception:
         pass
     return None
+
+# ============================================================
+# 🧠 ОЦЕНКА ВЕРОЯТНОСТИ (наша модель)
+# ============================================================
 
 def estimate_fair_probability(market: dict) -> float | None:
-    try:
-        op = market.get("outcomePrices", "[]")
-        if isinstance(op, str):
-            op = json.loads(op)
-        if len(op) >= 2:
-            p_yes, p_no = float(op[0]), float(op[1])
-            total = p_yes + p_no
-            if total > 0:
-                return p_yes / total
-    except Exception:
-        pass
-    return None
-
-def analyze_market(market: dict) -> dict | None:
-    try:
-        volume    = float(market.get("volume", 0) or 0)
-        liquidity = float(market.get("liquidity", 0) or 0)
-        if volume < MIN_VOLUME or liquidity < 1000:
+    """
+    Простая эвристическая модель оценки справедливой вероятности.
+    
+    В реальной торговле ты заменяешь это своим анализом:
+    - для спортивных событий: статистика команд
+    - для политики: данные опросов
+    - для крипты: on-chain метрики
+    
+    Здесь — базовая модель на основе истории рынка.
+    """
+    
+    outcomes = market.get("outcomes", "[]")
+    if isinstance(outcomes, str):
+        try:
+            outcomes = json.loads(outcomes)
+        except Exception:
             return None
 
-        # Достаём token_id
-        token_id = None
-        ids = market.get("clobTokenIds")
-        if isinstance(ids, str):
-            ids = json.loads(ids)
-        if isinstance(ids, list) and ids:
-            token_id = ids[0]
+    outcome_prices = market.get("outcomePrices", "[]")
+    if isinstance(outcome_prices, str):
+        try:
+            outcome_prices = json.loads(outcome_prices)
+        except Exception:
+            return None
+
+    if not outcomes or not outcome_prices:
+        return None
+
+    # Для бинарного рынка (Да/Нет)
+    if len(outcomes) == 2 and len(outcome_prices) == 2:
+        try:
+            p_yes = float(outcome_prices[0])
+            p_no  = float(outcome_prices[1])
+            total = p_yes + p_no
+
+            # Нормализуем (убираем спред маркет-мейкера)
+            if total > 0:
+                fair_prob = p_yes / total
+                return fair_prob
+        except Exception:
+            pass
+
+    return None
+
+# ============================================================
+# 🔎 АНАЛИЗ ОДНОГО РЫНКА
+# ============================================================
+
+def analyze_market(market: dict) -> dict | None:
+    """
+    Возвращает словарь с анализом если рынок интересен,
+    иначе None.
+    """
+    try:
+        # Базовые данные
+        title       = market.get("question", "")
+        slug        = market.get("slug", "")
+        volume      = float(market.get("volume", 0) or 0)
+        liquidity   = float(market.get("liquidity", 0) or 0)
+        end_date_str= market.get("endDate", "")
+        token_id    = None
+
+        # Достаём token_id для CLOB запроса
+        clob_rewards = market.get("clobTokenIds")
+        if clob_rewards:
+            if isinstance(clob_rewards, str):
+                try:
+                    ids = json.loads(clob_rewards)
+                    token_id = ids[0] if ids else None
+                except Exception:
+                    pass
+            elif isinstance(clob_rewards, list):
+                token_id = clob_rewards[0] if clob_rewards else None
+
+        # Фильтры
+        if volume < MIN_VOLUME:
+            return None
+        if liquidity < MIN_LIQUIDITY:
+            return None
         if not token_id:
             return None
 
+        # Наша оценка вероятности
         fair_prob = estimate_fair_probability(market)
         if fair_prob is None:
             return None
 
-        market_price = get_clob_price(token_id)
-        if not market_price or not (MIN_PRICE <= market_price <= MAX_PRICE):
+        # Рыночная цена
+        clob_data = get_clob_price(token_id)
+        if not clob_data:
             return None
 
+        market_price = clob_data["buy_price"]
+
+        # Фильтр по цене
+        if market_price < MIN_PRICE or market_price > MAX_PRICE:
+            return None
+
+        # Считаем edge (насколько рынок недооценивает вероятность)
         edge = fair_prob - market_price
+
         if edge < MIN_EDGE:
             return None
 
+        # Потенциальный ROI если событие случится
+        roi = (1.0 - market_price) / market_price * 100
+
         # Дней до закрытия
         days_left = None
-        end_date = market.get("endDate", "")
-        if end_date:
+        if end_date_str:
             try:
-                end_dt    = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-                days_left = (end_dt - datetime.now(timezone.utc)).days
+                end_dt    = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                now       = datetime.now(timezone.utc)
+                days_left = (end_dt - now).days
             except Exception:
                 pass
 
+        link = f"https://polymarket.com/event/{slug}"
+
         return {
-            "title":        market.get("question", ""),
-            "link":         f"https://polymarket.com/event/{market.get('slug', '')}",
+            "title":        title,
+            "link":         link,
             "market_price": market_price,
             "fair_prob":    fair_prob,
             "edge":         edge,
-            "roi":          (1.0 - market_price) / market_price * 100,
+            "roi":          roi,
             "volume":       volume,
             "liquidity":    liquidity,
             "days_left":    days_left,
         }
-    except Exception:
+
+    except Exception as e:
+        print(f"  [Analyze Error] {e}")
         return None
 
 # ============================================================
 # 📣 ФОРМАТИРОВАНИЕ АЛЕРТА
 # ============================================================
 
-def format_alert(r: dict) -> str:
-    edge_pct   = r["edge"] * 100
-    quality    = "🔥 СИЛЬНЫЙ" if edge_pct >= 20 else ("⚡ ХОРОШИЙ" if edge_pct >= 12 else "💡 СИГНАЛ")
-    days_str   = f"{r['days_left']} дн." if r["days_left"] is not None else "—"
+def format_alert(result: dict) -> str:
+    edge_pct    = result["edge"] * 100
+    market_pct  = result["market_price"] * 100
+    fair_pct    = result["fair_prob"] * 100
+
+    # Оценка качества находки
+    if edge_pct >= 20:
+        quality = "🔥 СИЛЬНЫЙ СИГНАЛ"
+    elif edge_pct >= 12:
+        quality = "⚡ ХОРОШИЙ СИГНАЛ"
+    else:
+        quality = "💡 УМЕРЕННЫЙ СИГНАЛ"
+
+    days_str = f"{result['days_left']} дн." if result["days_left"] is not None else "неизвестно"
 
     return (
         f"{quality}\n\n"
-        f"📋 <b>{r['title']}</b>\n\n"
-        f"💰 Рыночная цена:  <b>{r['market_price']*100:.1f}%</b>\n"
-        f"🎯 Наша оценка:     <b>{r['fair_prob']*100:.1f}%</b>\n"
-        f"📈 Преимущество:   <b>+{edge_pct:.1f}%</b>\n"
-        f"💵 ROI при победе: <b>{r['roi']:.0f}%</b>\n\n"
-        f"📊 Объём:    ${r['volume']:,.0f}\n"
-        f"💧 Ликвидность: ${r['liquidity']:,.0f}\n"
-        f"⏳ До закрытия: {days_str}\n\n"
-        f"🔗 <a href='{r['link']}'>Открыть на Polymarket</a>\n\n"
-        f"⚠️ <i>Информационный алерт. Решение за тобой.</i>"
+        f"📋 <b>{result['title']}</b>\n\n"
+        f"💰 Рыночная цена:   <b>{market_pct:.1f}%</b>\n"
+        f"🎯 Наша оценка:      <b>{fair_pct:.1f}%</b>\n"
+        f"📈 Преимущество:    <b>+{edge_pct:.1f}%</b>\n"
+        f"💵 ROI при победе:  <b>{result['roi']:.0f}%</b>\n\n"
+        f"📊 Объём торгов:  ${result['volume']:,.0f}\n"
+        f"💧 Ликвидность:    ${result['liquidity']:,.0f}\n"
+        f"⏳ До закрытия:   {days_str}\n\n"
+        f"🔗 <a href='{result['link']}'>Открыть на Polymarket</a>\n\n"
+        f"⚠️ <i>Это информационный алерт. Решение за тобой.</i>"
     )
 
 # ============================================================
-# 🔄 ПОТОК СКАНИРОВАНИЯ
+# 🚀 ОСНОВНОЙ ЦИКЛ СКАНИРОВАНИЯ
 # ============================================================
 
-def scanner_loop():
+def run():
+    print("=" * 55)
+    print("🔍 Polymarket Scanner запущен")
+    print(f"   Минимальный edge:    {MIN_EDGE*100:.0f}%")
+    print(f"   Минимальный объём:   ${MIN_VOLUME:,}")
+    print(f"   Интервал:            {SCAN_INTERVAL//60} минут")
+    print("=" * 55)
+
+    send_telegram(
+        "🔍 <b>Polymarket Scanner запущен!</b>\n\n"
+        f"Параметры:\n"
+        f"• Минимальный edge: {MIN_EDGE*100:.0f}%\n"
+        f"• Минимальный объём: ${MIN_VOLUME:,}\n"
+        f"• Интервал сканирования: {SCAN_INTERVAL//60} мин\n\n"
+        f"Жду интересных рынков... 👀"
+    )
+
     scan_count  = 0
     alert_count = 0
-    seen        = set()
-
-    print("[Scanner] Поток запущен")
-    time.sleep(5)  # ждём пока бот стартует
 
     while True:
         scan_count += 1
         ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[{ts}] Скан #{scan_count}")
+        print(f"\n[{ts}] Скан #{scan_count}")
 
-        markets = get_active_markets()
-        found   = []
+        # Загружаем рынки
+        markets = get_active_markets(limit=150)
+        print(f"  Загружено рынков: {len(markets)}")
+
+        found = []
 
         for market in markets:
             result = analyze_market(market)
             if result:
-                key = f"{result['title']}_{result['market_price']:.3f}"
-                if key not in seen:
-                    found.append(result)
-                    seen.add(key)
-            time.sleep(0.3)
+                found.append(result)
+            time.sleep(0.3)  # пауза между запросами
 
-        # Очищаем seen раз в 100 сканов чтобы не копился
-        if scan_count % 100 == 0:
-            seen.clear()
-
+        # Сортируем по силе сигнала
         found.sort(key=lambda x: x["edge"], reverse=True)
-        print(f"  Найдено новых сигналов: {len(found)}")
 
-        for result in found[:3]:
-            if send_telegram(format_alert(result)):
-                alert_count += 1
-                print(f"  ✅ {result['title'][:50]}... edge={result['edge']*100:.1f}%")
-            time.sleep(2)
+        print(f"  Найдено сигналов: {len(found)}")
 
-        print(f"  Всего алертов: {alert_count} | Следующий скан через {SCAN_INTERVAL//60} мин")
+        if found:
+            # Отправляем топ-3 за скан чтобы не спамить
+            for result in found[:3]:
+                msg = format_alert(result)
+                if send_telegram(msg):
+                    alert_count += 1
+                    print(f"  ✅ Алерт: {result['title'][:50]}...")
+                time.sleep(2)
+        else:
+            print("  Недооценённых рынков не найдено")
+
+        print(f"  Всего алертов отправлено: {alert_count}")
+        print(f"  Следующий скан через {SCAN_INTERVAL//60} минут...")
         time.sleep(SCAN_INTERVAL)
 
 # ============================================================
-# 🔄 ПОТОК ОБРАБОТКИ КОМАНД
-# ============================================================
-
-def polling_loop():
-    print("[Polling] Поток запущен")
-    while True:
-        get_updates()
-        time.sleep(3)
-
-# ============================================================
-# 🚀 ЗАПУСК
+# ▶️  ЗАПУСК
 # ============================================================
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("🤖 Polymarket Scanner Bot")
-    print(f"   Token:    {'✅ задан' if TELEGRAM_TOKEN else '❌ не задан'}")
-    print(f"   Chat ID:  {'✅ задан' if TELEGRAM_CHAT_ID else '❌ не задан'}")
-    print(f"   Edge:     {MIN_EDGE*100:.0f}%")
-    print(f"   Интервал: {SCAN_INTERVAL//60} мин")
-    print("=" * 50)
-
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("\n❌ Задай переменные окружения:")
-        print("   TELEGRAM_TOKEN=твой_токен")
-        print("   TELEGRAM_CHAT_ID=твой_chat_id")
-        exit(1)
-
-    send_telegram(
-        "🚀 <b>Polymarket Scanner Bot запущен!</b>\n\n"
-        f"• Edge порог: {MIN_EDGE*100:.0f}%\n"
-        f"• Мин. объём: ${MIN_VOLUME:,.0f}\n"
-        f"• Интервал: {SCAN_INTERVAL//60} мин\n\n"
-        "Напиши /status чтобы проверить статус бота."
-    )
-
-    # Запускаем два потока параллельно
-    t1 = threading.Thread(target=scanner_loop, daemon=True)
-    t2 = threading.Thread(target=polling_loop, daemon=True)
-    t1.start()
-    t2.start()
-
-    # Держим главный поток живым
-    while True:
-        time.sleep(60)
+    if TELEGRAM_TOKEN == "ТВОЙ_ТОКЕН_БОТА":
+        print("❌ Заполни TELEGRAM_TOKEN и TELEGRAM_CHAT_ID!")
+        print()
+        print("Инструкция:")
+        print("1. Напиши @BotFather в Telegram → /newbot → скопируй токен")
+        print("2. Напиши @userinfobot → скопируй свой id")
+        print("3. Вставь оба значения в начало скрипта")
+        print("4. Запусти: python polymarket_scanner.py")
+    else:
+        run()
