@@ -24,7 +24,7 @@ print(f"All env keys: {[k for k in os.environ.keys() if 'TELEGRAM' in k]}")
 
 MIN_EDGE       = float(os.environ.get("MIN_EDGE", "0.08"))       # 8% минимальный edge
 MIN_VOLUME     = float(os.environ.get("MIN_VOLUME", "5000"))     # $5k минимальный объём
-SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL", "600"))     # 10 минут
+SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL", "60"))     # 10 минут
 MIN_PRICE      = 0.03
 MAX_PRICE      = 0.80
 
