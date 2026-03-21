@@ -18,6 +18,10 @@ from datetime import datetime, timezone
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+# Отладка — удалим после решения проблемы
+print(f"ENV vars: TOKEN={bool(TELEGRAM_TOKEN)} CHAT={bool(TELEGRAM_CHAT_ID)}")
+print(f"All env keys: {[k for k in os.environ.keys() if 'TELEGRAM' in k]}")
+
 MIN_EDGE       = float(os.environ.get("MIN_EDGE", "0.08"))       # 8% минимальный edge
 MIN_VOLUME     = float(os.environ.get("MIN_VOLUME", "5000"))     # $5k минимальный объём
 SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL", "600"))     # 10 минут
