@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-🔍 Polymarket Scanner Bot v5
-- Память сигналов (без спама, повтор только при росте скора)
-- Результаты закрытых рынков
-- Дневной дайджест в 9 утра
-- Резкий рост объёма за последний час
-- Тренд цены за 24ч + активность + новости
+🎯 Polymarket Sure-Thing Bot v2
+Главная фича: детектор "уже случившихся" событий
+- Событие произошло, рынок ещё открыт, цена не 99¢
+- Покупаешь 92-98¢, ждёшь резолюции, забираешь разницу
 """
 
 import requests
@@ -23,135 +21,335 @@ from datetime import datetime, timezone, timedelta
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-MIN_EDGE        = float(os.environ.get("MIN_EDGE", "0.03"))
-MIN_VOLUME      = float(os.environ.get("MIN_VOLUME", "1000"))
-SCAN_INTERVAL   = int(os.environ.get("SCAN_INTERVAL", "60"))
-MIN_PROB        = 0.20
-MAX_PRICE       = 0.80
-MIN_DAYS_LEFT   = 1
-DIGEST_HOUR     = int(os.environ.get("DIGEST_HOUR", "9"))  # час дайджеста UTC
+SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL", "120"))
+DIGEST_HOUR    = int(os.environ.get("DIGEST_HOUR", "9"))
+
+MIN_PRICE      = float(os.environ.get("MIN_PRICE", "0.88"))
+MAX_PRICE      = float(os.environ.get("MAX_PRICE", "0.985"))
+MIN_LIQUIDITY  = float(os.environ.get("MIN_LIQUIDITY", "3000"))
+MIN_VOLUME     = float(os.environ.get("MIN_VOLUME", "5000"))
+MIN_DAYS       = int(os.environ.get("MIN_DAYS", "0"))
+MAX_DAYS       = int(os.environ.get("MAX_DAYS", "30"))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
 
 # ============================================================
-# 💾 ПАМЯТЬ СИГНАЛОВ
+# 🕵️  ДЕТЕКТОР "УЖЕ СЛУЧИВШИХСЯ" СОБЫТИЙ
 # ============================================================
 
-# Структура: { "market_title_hash": { "score": 72, "sent_at": "2026-03-21T...", "price": 0.28 } }
-signal_memory = {}
+# Паттерны которые указывают что событие УЖЕ должно быть известно
+ALREADY_HAPPENED_PATTERNS = [
+    # Прошедшее время
+    "did ", "was ", "were ", "has ", "have ", "had ",
+    "won ", "lost ", "passed ", "failed ", "signed ", "announced ",
+    "approved ", "rejected ", "confirmed ", "released ", "launched ",
+    "reached ", "exceeded ", "dropped ", "rose ", "fell ",
 
-# Закрытые рынки для отслеживания результатов
-# Структура: { "market_id": { "title": "...", "our_call": "YES", "entry_price": 0.28, "sent_at": "..." } }
-tracked_markets = {}
+    # Временные маркеры прошлого
+    "by end of", "before end", "in q1", "in q2", "in q3", "in q4",
+    "in january", "in february", "in march", "in april",
+    "in may", "in june", "in july", "in august",
+    "in september", "in october", "in november", "in december",
+    "this week", "this month",
+]
 
-# Флаг чтобы дайджест не слался дважды в один день
+# Паттерны событий которые обычно известны заранее
+PREDICTABLE_PATTERNS = [
+    # Финансовые отчёты — дата известна
+    "earnings", "report", "quarterly", "revenue", "gdp",
+    "cpi", "inflation data", "jobs report", "unemployment",
+    "fed meeting", "fomc", "rate decision", "interest rate",
+
+    # Крипто — цена известна в реальном времени
+    "bitcoin above", "bitcoin below", "btc above", "btc below",
+    "ethereum above", "ethereum below", "eth above", "eth below",
+    "crypto above", "crypto below",
+
+    # Политические решения — часто уже приняты
+    "bill passes", "vote passes", "legislation", "law signed",
+    "treaty signed", "agreement signed", "deal signed",
+
+    # Технологии — анонсы обычно известны
+    "release", "launch", "announce", "unveil",
+]
+
+# Спорт — всегда исключаем
+SPORTS_KEYWORDS = [
+    "nba", "nfl", "nhl", "mlb", "ufc", "mma", "fifa",
+    "game 1", "game 2", " vs ", "match", "score",
+    "playoff", "championship", "tournament", "world cup",
+    "super bowl", "f1 ", "grand prix", "tennis", "golf",
+    "boxing", "esports", "lol:", "csgo", "dota"
+]
+
+def detect_already_happened(title: str, market: dict) -> dict:
+    """
+    Пытаемся определить произошло ли событие уже.
+    Возвращаем: {
+        "confidence": 0-100,  # уверенность что событие уже случилось
+        "reason": "...",       # почему так думаем
+        "type": "...",         # тип детекции
+    }
+    """
+    t = title.lower()
+
+    # 1. Спорт — пропускаем
+    if any(kw in t for kw in SPORTS_KEYWORDS):
+        return {"confidence": 0, "reason": "спорт", "type": "skip"}
+
+    confidence = 0
+    reasons    = []
+    det_type   = "unknown"
+
+    # 2. Крипто цена — можно проверить прямо сейчас
+    crypto_check = check_crypto_price(title)
+    if crypto_check["checked"]:
+        if crypto_check["already_true"]:
+            confidence = 95
+            reasons.append(f"✅ Проверено: {crypto_check['detail']}")
+            det_type = "crypto_verified"
+        else:
+            confidence = 5
+            reasons.append(f"❌ Проверено: {crypto_check['detail']}")
+            det_type = "crypto_verified"
+        return {"confidence": confidence, "reason": " | ".join(reasons), "type": det_type}
+
+    # 3. Паттерны прошедшего времени
+    past_matches = [p for p in ALREADY_HAPPENED_PATTERNS if p in t]
+    if past_matches:
+        confidence += len(past_matches) * 15
+        reasons.append(f"Паттерн прошлого: {', '.join(past_matches[:2])}")
+        det_type = "past_pattern"
+
+    # 4. Предсказуемые события
+    pred_matches = [p for p in PREDICTABLE_PATTERNS if p in t]
+    if pred_matches:
+        confidence += len(pred_matches) * 10
+        reasons.append(f"Предсказуемое: {', '.join(pred_matches[:2])}")
+        if det_type == "unknown":
+            det_type = "predictable"
+
+    # 5. Цена уже высокая (95%+) — рынок уже "знает"
+    op = market.get("outcomePrices", "[]")
+    if isinstance(op, str):
+        try:
+            op = json.loads(op)
+        except Exception:
+            op = []
+    if op:
+        try:
+            market_consensus = float(op[0])
+            if market_consensus >= 0.97:
+                confidence += 20
+                reasons.append(f"Рынок уже оценивает в {market_consensus*100:.0f}%")
+            elif market_consensus >= 0.94:
+                confidence += 10
+                reasons.append(f"Высокий консенсус {market_consensus*100:.0f}%")
+        except Exception:
+            pass
+
+    # 6. Объём резко вырос (люди уже знают)
+    volume    = float(market.get("volume", 0) or 0)
+    liquidity = float(market.get("liquidity", 0) or 0)
+    if volume > 0 and liquidity > 0:
+        vol_liq_ratio = volume / max(liquidity, 1)
+        if vol_liq_ratio > 10:
+            confidence += 10
+            reasons.append(f"Высокий оборот (x{vol_liq_ratio:.0f})")
+
+    # Ограничиваем максимум без прямой проверки
+    if det_type != "crypto_verified":
+        confidence = min(confidence, 75)
+
+    return {
+        "confidence": confidence,
+        "reason":     " | ".join(reasons) if reasons else "нет явных признаков",
+        "type":       det_type,
+    }
+
+def check_crypto_price(title: str) -> dict:
+    """
+    Проверяем крипто условия напрямую через CoinGecko (бесплатно).
+    Например: "Will BTC be above $80k by end of March?"
+    """
+    result = {"checked": False, "already_true": False, "detail": ""}
+    t      = title.lower()
+
+    # Определяем монету
+    coin_map = {
+        "bitcoin": "bitcoin", "btc": "bitcoin",
+        "ethereum": "ethereum", "eth": "ethereum",
+        "solana": "solana", "sol": "solana",
+        "xrp": "ripple", "ripple": "ripple",
+    }
+
+    coin_id = None
+    for keyword, cid in coin_map.items():
+        if keyword in t:
+            coin_id = cid
+            break
+
+    if not coin_id:
+        return result
+
+    # Извлекаем целевую цену из названия
+    import re
+    price_patterns = [
+        r'\$(\d+[,\d]*(?:\.\d+)?)[kK]?',
+    ]
+    target_price = None
+    for pattern in price_patterns:
+        match = re.search(pattern, title)
+        if match:
+            price_str = match.group(1).replace(",", "")
+            try:
+                p = float(price_str)
+                # Если число маленькое — может быть в тысячах
+                if "k" in title[match.start():match.end()+1].lower():
+                    p *= 1000
+                target_price = p
+                break
+            except Exception:
+                pass
+
+    if not target_price:
+        return result
+
+    # Получаем текущую цену
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": coin_id, "vs_currencies": "usd"},
+            timeout=8
+        )
+        if r.status_code == 200:
+            data        = r.json()
+            current_usd = data.get(coin_id, {}).get("usd", 0)
+            if current_usd > 0:
+                result["checked"] = True
+                # Определяем направление
+                if "above" in t or "over" in t or "exceed" in t or "higher" in t:
+                    result["already_true"] = current_usd > target_price
+                    result["detail"] = (
+                        f"{coin_id.upper()} сейчас ${current_usd:,.0f} "
+                        f"{'>' if current_usd > target_price else '<'} "
+                        f"цель ${target_price:,.0f}"
+                    )
+                elif "below" in t or "under" in t or "lower" in t:
+                    result["already_true"] = current_usd < target_price
+                    result["detail"] = (
+                        f"{coin_id.upper()} сейчас ${current_usd:,.0f} "
+                        f"{'<' if current_usd < target_price else '>'} "
+                        f"цель ${target_price:,.0f}"
+                    )
+    except Exception as e:
+        print(f"  [CoinGecko Error] {e}")
+
+    return result
+
+# ============================================================
+# 📰 НОВОСТИ — проверяем есть ли подтверждение события
+# ============================================================
+
+def check_news_confirmation(title: str) -> dict:
+    """
+    Ищем новости которые подтверждают что событие уже произошло.
+    """
+    result = {"confirmed": False, "count": 0, "headline": ""}
+    try:
+        words = title.split()[:6]
+        query = "+".join(words)
+        r     = requests.get(
+            f"https://news.google.com/rss/search?q={query}&hl=en&gl=US&ceid=US:en",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8
+        )
+        if r.status_code != 200:
+            return result
+
+        root    = ET.fromstring(r.content)
+        channel = root.find("channel")
+        if channel is None:
+            return result
+
+        now   = datetime.now(timezone.utc)
+        count = 0
+        headlines = []
+
+        # Слова подтверждения в заголовках
+        confirm_words = [
+            "confirms", "confirmed", "officially", "signs", "signed",
+            "passes", "passed", "approves", "approved", "announces",
+            "announced", "reaches", "exceeded", "hits", "achieves",
+            "wins", "won", "loses", "lost", "releases", "launches"
+        ]
+
+        for item in channel.findall("item"):
+            try:
+                pub_date = item.findtext("pubDate", "")
+                headline = item.findtext("title", "")
+                if not pub_date or not headline:
+                    continue
+                from email.utils import parsedate_to_datetime
+                pub_dt = parsedate_to_datetime(pub_date)
+                if pub_dt.tzinfo is None:
+                    pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+                diff_h = (now - pub_dt).total_seconds() / 3600
+                if diff_h <= 72:  # последние 72 часа
+                    count += 1
+                    h_lower = headline.lower()
+                    if any(cw in h_lower for cw in confirm_words):
+                        result["confirmed"] = True
+                        if not result["headline"]:
+                            result["headline"] = headline.split(" - ")[0][:80]
+            except Exception:
+                continue
+
+        result["count"] = count
+
+    except Exception as e:
+        print(f"  [News Error] {e}")
+
+    return result
+
+# ============================================================
+# 💾 ПАМЯТЬ
+# ============================================================
+
+signal_memory    = {}
+tracked_markets  = {}
 last_digest_date = None
 
 def signal_key(title: str) -> str:
-    return str(hash(title))[:12]
+    return str(abs(hash(title)))[:12]
 
-def should_send_signal(result: dict) -> bool:
-    """Проверяем стоит ли отправлять сигнал или это спам"""
-    key   = signal_key(result["title"])
-    score = result["score"]
-    price = result["market_price"]
-
+def already_sent(title: str, price: float) -> bool:
+    key = signal_key(title)
     if key not in signal_memory:
-        return True  # новый сигнал — отправляем
+        return False
+    prev_price = signal_memory[key].get("price", 0)
+    if price <= prev_price - 0.01:
+        return False
+    return True
 
-    prev = signal_memory[key]
-
-    # Повторяем если скор вырос на 20+ пунктов
-    if score >= prev["score"] + 20:
-        return True
-
-    # Повторяем если цена упала на 5%+ (новая возможность)
-    if price <= prev["price"] - 0.05:
-        return True
-
-    # Повторяем не чаще раза в 6 часов даже если изменилось
-    sent_at = datetime.fromisoformat(prev["sent_at"])
-    if datetime.now(timezone.utc) - sent_at > timedelta(hours=6):
-        if score >= prev["score"] + 5:
-            return True
-
-    return False
-
-def remember_signal(result: dict):
-    """Запоминаем отправленный сигнал"""
+def remember(result: dict):
     key = signal_key(result["title"])
     signal_memory[key] = {
-        "score":    result["score"],
-        "price":    result["market_price"],
-        "sent_at":  datetime.now(timezone.utc).isoformat(),
-        "title":    result["title"],
-        "category": result["category"],
-        "edge":     result["edge"],
-        "roi":      result["roi"],
+        "price":      result["price"],
+        "roi":        result["roi"],
+        "sent_at":    datetime.now(timezone.utc).isoformat(),
+        "title":      result["title"],
+        "days":       result["days_left"],
+        "confidence": result.get("confidence", 0),
+        "type":       result.get("det_type", ""),
     }
-
-    # Добавляем в отслеживание для проверки результата
-    market_id = result.get("market_id", key)
-    tracked_markets[market_id] = {
+    tracked_markets[result["market_id"]] = {
         "title":       result["title"],
-        "our_call":    "YES",  # мы всегда рекомендуем YES (недооценённый)
-        "entry_price": result["market_price"],
-        "fair_prob":   result["fair_prob"],
+        "entry_price": result["price"],
         "sent_at":     datetime.now(timezone.utc).isoformat(),
-        "days_left":   result.get("days_left"),
-        "category":    result["category"],
+        "days_left":   result["days_left"],
     }
-
-# ============================================================
-# 🏷️  КАТЕГОРИИ
-# ============================================================
-
-CATEGORIES = {
-    "🗳️ Политика": [
-        "election", "president", "vote", "poll", "senate", "congress",
-        "republican", "democrat", "trump", "harris", "approval", "party",
-        "minister", "chancellor", "government", "referendum", "candidate",
-        "mayor", "governor", "impeach", "resign", "parliament"
-    ],
-    "₿ Крипто": [
-        "bitcoin", "btc", "ethereum", "eth", "crypto", "blockchain",
-        "coinbase", "binance", "solana", "sol", "xrp", "ripple",
-        "defi", "token", "stablecoin", "fed", "rate", "inflation",
-        "recession", "gdp", "interest rate", "s&p", "nasdaq"
-    ],
-    "🌍 Геополитика": [
-        "war", "conflict", "invasion", "sanction", "nato", "treaty",
-        "ceasefire", "nuclear", "missile", "iran", "russia", "ukraine",
-        "china", "taiwan", "israel", "hamas", "coup", "attack", "strike",
-        "troops", "military", "diplomat", "summit", "alliance"
-    ],
-    "🤖 Технологии/ИИ": [
-        "openai", "chatgpt", "gpt", "claude", "anthropic", "gemini",
-        "artificial intelligence", "ai model", "agi", "nvidia", "apple",
-        "google", "microsoft", "meta", "spacex", "starship", "launch",
-        "tesla", "ipo", "acquisition", "merger"
-    ],
-}
-
-SPORTS_KEYWORDS = [
-    "nba", "nfl", "nhl", "mlb", "ufc", "mma", "fifa", "premier league",
-    "champions league", "la liga", "bundesliga", "serie a", "ligue 1",
-    "game 1", "game 2", "game 3", " vs ", "tournament", "playoff",
-    "championship", "world cup", "super bowl", "formula 1", "f1 ",
-    "grand prix", "tennis", "wimbledon", "golf", "pga", "boxing",
-    "wrestling", "esports", "lol:", "csgo", "dota", "bilibili",
-    "t1 ", "fnatic", "team liquid", "innings", "wicket"
-]
-
-def get_category(title: str) -> str | None:
-    t = title.lower()
-    if any(kw in t for kw in SPORTS_KEYWORDS):
-        return None
-    for category, keywords in CATEGORIES.items():
-        if any(kw in t for kw in keywords):
-            return category
-    return None
 
 # ============================================================
 # 📨 TELEGRAM
@@ -176,7 +374,7 @@ def send_telegram(message: str) -> bool:
         return False
 
 # ============================================================
-# 📡 TELEGRAM POLLING
+# 📡 POLLING + КОМАНДЫ
 # ============================================================
 
 last_update_id = 0
@@ -184,419 +382,171 @@ last_update_id = 0
 def get_updates():
     global last_update_id
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+        url    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
         params = {"offset": last_update_id + 1, "timeout": 5}
-        r = requests.get(url, params=params, timeout=10)
+        r      = requests.get(url, params=params, timeout=10)
         if r.status_code == 200:
-            updates = r.json().get("result", [])
-            for upd in updates:
+            for upd in r.json().get("result", []):
                 last_update_id = upd["update_id"]
                 handle_command(upd)
     except Exception:
         pass
 
 def handle_command(update: dict):
-    msg  = update.get("message", {})
-    text = msg.get("text", "")
+    text = update.get("message", {}).get("text", "")
     if not text:
         return
     if text == "/start":
         send_telegram(
-            "👋 <b>Polymarket Scanner Bot v5</b>\n\n"
-            "Категории:\n"
-            "🗳️ Политика  ₿ Крипто\n"
-            "🌍 Геополитика  🤖 ИИ/Тех\n"
-            "⛔ Спорт исключён\n\n"
-            "Анализирую:\n"
-            "• 📉 Тренд цены за 24ч\n"
-            "• ⚡ Активность и объём\n"
-            "• 📰 Новостной контекст\n"
-            "• 💾 Память (без спама)\n"
-            "• 🏆 Результаты закрытых рынков\n\n"
-            f"Edge: {MIN_EDGE*100:.0f}% | Мин.шанс: {MIN_PROB*100:.0f}%\n\n"
-            "Команды:\n"
-            "/scan — ручной скан\n"
-            "/status — статус бота\n"
-            "/results — результаты сигналов\n"
-            "/digest — дайджест прямо сейчас"
+            "👋 <b>Sure-Thing Bot v2</b>\n\n"
+            "Ищу события которые <b>уже случились</b>\n"
+            "но рынок ещё не закрылся.\n\n"
+            "Типы сигналов:\n"
+            "🔵 Крипто цена — проверяю прямо сейчас\n"
+            "🟢 Подтверждено новостями\n"
+            "🟡 Высокая вероятность по паттернам\n\n"
+            f"• Диапазон: {MIN_PRICE*100:.0f}–{MAX_PRICE*100:.0f}¢\n"
+            f"• Ликвидность: ${MIN_LIQUIDITY:,.0f}+\n\n"
+            "Команды: /scan /status /results /digest /calc"
         )
     elif text == "/status":
         send_telegram(
             f"✅ <b>Бот работает</b>\n"
             f"🕐 {datetime.now().strftime('%H:%M %d.%m.%Y')}\n"
-            f"⏱️ Интервал: {SCAN_INTERVAL//60} мин\n"
-            f"💾 Сигналов в памяти: {len(signal_memory)}\n"
-            f"🏆 Отслеживается рынков: {len(tracked_markets)}"
+            f"💾 В памяти: {len(signal_memory)} сигналов\n"
+            f"📊 Отслеживается: {len(tracked_markets)} рынков"
         )
     elif text == "/scan":
-        send_telegram("🔍 Запускаю ручной скан...")
+        send_telegram("🔍 Сканирую...")
         threading.Thread(target=manual_scan, daemon=True).start()
     elif text == "/results":
         threading.Thread(target=send_results, daemon=True).start()
     elif text == "/digest":
         threading.Thread(target=send_digest, daemon=True).start()
+    elif text == "/calc":
+        send_calc()
+
+def send_calc():
+    lines = ["🧮 <b>Калькулятор стратегии</b>\n"]
+    for budget in [100, 500, 1000, 2000]:
+        stake  = budget / 20
+        # 19 побед из 20 при цене 0.94¢
+        profit = 19 * stake * (1/0.94 - 1) - 1 * stake
+        pct    = (profit / budget) * 100
+        lines.append(
+            f"💰 ${budget}: 20 ставок по ${stake:.0f} "
+            f"→ <b>+${profit:.0f} ({pct:.1f}%)</b>"
+        )
+    lines.append("\n<i>*При 19/20 побед, цена входа 94¢</i>")
+    send_telegram("\n".join(lines))
 
 # ============================================================
 # 🏆 РЕЗУЛЬТАТЫ ЗАКРЫТЫХ РЫНКОВ
 # ============================================================
 
 def check_closed_markets():
-    """Проверяем закрылись ли отслеживаемые рынки и каков результат"""
-    if not tracked_markets:
-        return
-
     to_remove = []
-
-    for market_id, info in tracked_markets.items():
+    for market_id, info in list(tracked_markets.items()):
         try:
-            r = requests.get(
-                f"{GAMMA_API}/markets/{market_id}",
-                timeout=10
-            )
+            r = requests.get(f"{GAMMA_API}/markets/{market_id}", timeout=10)
             if r.status_code != 200:
                 continue
-
             market = r.json()
-            active = market.get("active", True)
-
-            if not active:
-                # Рынок закрылся — узнаём результат
-                winner_outcome = None
-                outcome_prices = market.get("outcomePrices", "[]")
-                if isinstance(outcome_prices, str):
-                    outcome_prices = json.loads(outcome_prices)
-
-                # Выигравший исход имеет цену 1.0
-                if outcome_prices and float(outcome_prices[0]) >= 0.99:
-                    winner_outcome = "YES"
-                elif outcome_prices and len(outcome_prices) > 1 and float(outcome_prices[1]) >= 0.99:
-                    winner_outcome = "NO"
-
-                if winner_outcome:
-                    our_call    = info["our_call"]
-                    entry_price = info["entry_price"]
-                    won         = (winner_outcome == our_call)
-
-                    if won:
-                        profit_pct = ((1.0 - entry_price) / entry_price) * 100
-                        result_str = f"✅ ВЫИГРАЛ! ROI: +{profit_pct:.0f}%"
-                    else:
-                        result_str = f"❌ Не сработал. Потеря: -{entry_price*100:.0f}¢ на $1"
-
-                    send_telegram(
-                        f"🏆 <b>Результат сигнала</b>\n\n"
-                        f"{info['category']}\n"
-                        f"<b>{info['title']}</b>\n\n"
-                        f"📌 Наш прогноз: {our_call}\n"
-                        f"💰 Цена входа: {entry_price*100:.1f}¢\n"
-                        f"🎯 Исход: {winner_outcome}\n"
-                        f"{result_str}\n\n"
-                        f"📅 Сигнал был: {info['sent_at'][:10]}"
-                    )
-                    to_remove.append(market_id)
-
+            if market.get("active", True):
+                continue
+            op = market.get("outcomePrices", "[]")
+            if isinstance(op, str):
+                op = json.loads(op)
+            winner = None
+            if op and float(op[0]) >= 0.99:
+                winner = "YES"
+            elif len(op) > 1 and float(op[1]) >= 0.99:
+                winner = "NO"
+            if winner:
+                ep  = info["entry_price"]
+                won = (winner == "YES")
+                if won:
+                    profit = ((1.0 - ep) / ep) * 100
+                    res    = f"✅ ВЫИГРАЛ +{profit:.1f}%"
+                else:
+                    res = f"❌ ПРОИГРАЛ -{ep*100:.0f}¢ на $1"
+                send_telegram(
+                    f"🏁 <b>Результат</b>\n\n"
+                    f"{info['title']}\n\n"
+                    f"Вход: {ep*100:.1f}¢ | Исход: {winner}\n"
+                    f"<b>{res}</b>"
+                )
+                to_remove.append(market_id)
         except Exception as e:
             print(f"  [Results Error] {e}")
-
     for mid in to_remove:
         del tracked_markets[mid]
 
 def send_results():
-    """Команда /results — показать статус всех отслеживаемых сигналов"""
     if not tracked_markets:
-        send_telegram("📭 Нет активных отслеживаемых сигналов.")
+        send_telegram("📭 Нет активных позиций.")
         return
-
-    lines = ["📊 <b>Активные сигналы:</b>\n"]
+    lines = ["📊 <b>Активные позиции:</b>\n"]
     for mid, info in list(tracked_markets.items())[:10]:
-        days = info.get("days_left", "?")
+        ep  = info["entry_price"]
+        roi = ((1.0 - ep) / ep) * 100
         lines.append(
-            f"• {info['category']} | {info['title'][:45]}...\n"
-            f"  Вход: {info['entry_price']*100:.1f}% | Осталось: {days} дн."
+            f"• {info['title'][:50]}\n"
+            f"  Вход: {ep*100:.1f}¢ | ROI: +{roi:.1f}% | "
+            f"Осталось: {info['days_left']} дн."
         )
-
     send_telegram("\n".join(lines))
 
 # ============================================================
-# ⏰ ДНЕВНОЙ ДАЙДЖЕСТ
+# ⏰ ДАЙДЖЕСТ
 # ============================================================
 
 def send_digest():
-    """Топ-5 лучших сигналов из памяти за последние 24ч"""
-    now = datetime.now(timezone.utc)
-
-    recent = []
-    for key, info in signal_memory.items():
-        try:
-            sent_at = datetime.fromisoformat(info["sent_at"])
-            if (now - sent_at).total_seconds() <= 86400:
-                recent.append(info)
-        except Exception:
-            continue
-
+    now    = datetime.now(timezone.utc)
+    recent = [
+        info for info in signal_memory.values()
+        if (now - datetime.fromisoformat(info["sent_at"])).total_seconds() <= 86400
+    ]
     if not recent:
         send_telegram(
             f"☀️ <b>Дайджест {now.strftime('%d.%m.%Y')}</b>\n\n"
-            "За последние 24ч интересных сигналов не было."
+            "За 24ч новых сигналов не было."
         )
         return
 
-    recent.sort(key=lambda x: x.get("score", 0), reverse=True)
-    top = recent[:5]
-
-    lines = [f"☀️ <b>Дайджест {now.strftime('%d.%m.%Y')}</b>\n"
-             f"Топ сигналов за 24ч:\n"]
-
-    for i, info in enumerate(top, 1):
+    recent.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+    lines = [
+        f"☀️ <b>Дайджест {now.strftime('%d.%m.%Y')}</b>\n"
+        f"Сигналов за 24ч: {len(recent)}\n"
+    ]
+    for i, info in enumerate(recent[:7], 1):
         lines.append(
-            f"{i}. {info['category']} | Скор: {info.get('score', '?')}\n"
-            f"   <b>{info['title'][:55]}</b>\n"
-            f"   Edge: +{info['edge']*100:.1f}% | ROI: {info['roi']:.0f}%\n"
+            f"{i}. {info['title'][:55]}\n"
+            f"   {info['price']*100:.1f}¢ | "
+            f"+{info['roi']:.1f}% | "
+            f"уверенность: {info.get('confidence', '?')}%"
         )
-
     send_telegram("\n".join(lines))
 
 def digest_loop():
-    """Отправляем дайджест каждый день в DIGEST_HOUR UTC"""
     global last_digest_date
-    print(f"[Digest] Поток запущен, дайджест в {DIGEST_HOUR}:00 UTC")
     while True:
         now = datetime.now(timezone.utc)
         if now.hour == DIGEST_HOUR and now.date() != last_digest_date:
-            print(f"[Digest] Отправляю дайджест...")
             send_digest()
             last_digest_date = now.date()
         time.sleep(60)
 
 # ============================================================
-# 📈 ОБЪЁМ ЗА ПОСЛЕДНИЙ ЧАС
+# 📊 ПАРСИНГ РЫНКОВ
 # ============================================================
 
-def get_volume_spike(market_id: str, total_volume: float) -> dict:
-    """
-    Сравниваем объём последнего часа с средним часовым за 24ч.
-    Если в 3х+ раз больше — это спайк.
-    """
-    result = {"spike": False, "ratio": 1.0, "volume_1h": 0}
-    try:
-        r = requests.get(
-            f"{GAMMA_API}/trades",
-            params={"market": market_id, "limit": 200},
-            timeout=10
-        )
-        if r.status_code != 200:
-            return result
-
-        trades = r.json()
-        if not trades or not isinstance(trades, list):
-            return result
-
-        now = datetime.now(timezone.utc)
-        vol_1h  = 0.0
-        vol_24h = 0.0
-
-        for t in trades:
-            try:
-                ts_str = t.get("timestamp") or t.get("createdAt", "")
-                if not ts_str:
-                    continue
-                ts   = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                diff = (now - ts).total_seconds()
-                amount = float(t.get("amount", 0) or 0)
-                if diff <= 3600:
-                    vol_1h  += amount
-                if diff <= 86400:
-                    vol_24h += amount
-            except Exception:
-                continue
-
-        if vol_24h > 0:
-            avg_hourly = vol_24h / 24
-            if avg_hourly > 0:
-                ratio = vol_1h / avg_hourly
-                result["ratio"]     = round(ratio, 1)
-                result["volume_1h"] = round(vol_1h)
-                result["spike"]     = ratio >= 3.0  # в 3х раз выше среднего
-
-    except Exception as e:
-        print(f"  [Volume Spike Error] {e}")
-
-    return result
-
-# ============================================================
-# 📉 ТРЕНД ЦЕНЫ ЗА 24Ч
-# ============================================================
-
-def get_price_trend(market_id: str) -> dict:
-    result = {"trend": "unknown", "change_pct": 0, "signal": "neutral", "trades_24h": 0}
-    try:
-        r = requests.get(
-            f"{GAMMA_API}/trades",
-            params={"market": market_id, "limit": 100},
-            timeout=10
-        )
-        if r.status_code != 200:
-            return result
-
-        trades = r.json()
-        if not trades or not isinstance(trades, list):
-            return result
-
-        now        = datetime.now(timezone.utc)
-        trades_24h = []
-
-        for t in trades:
-            try:
-                ts_str = t.get("timestamp") or t.get("createdAt", "")
-                if not ts_str:
-                    continue
-                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                if (now - ts).total_seconds() <= 86400:
-                    trades_24h.append(t)
-            except Exception:
-                continue
-
-        result["trades_24h"] = len(trades_24h)
-
-        if len(trades_24h) < 2:
-            return result
-
-        prices = []
-        for t in trades_24h:
-            try:
-                p = float(t.get("price", 0))
-                if p > 0:
-                    prices.append(p)
-            except Exception:
-                continue
-
-        if len(prices) < 2:
-            return result
-
-        price_start = prices[-1]
-        price_now   = prices[0]
-
-        if price_start == 0:
-            return result
-
-        change_pct          = ((price_now - price_start) / price_start) * 100
-        result["change_pct"] = round(change_pct, 2)
-
-        if change_pct > 3:
-            result["trend"]  = "up"
-            result["signal"] = "caution"
-        elif change_pct < -3:
-            result["trend"]  = "down"
-            result["signal"] = "opportunity"
-        else:
-            result["trend"]  = "stable"
-            result["signal"] = "neutral"
-
-    except Exception as e:
-        print(f"  [Trend Error] {e}")
-
-    return result
-
-# ============================================================
-# 📰 НОВОСТИ
-# ============================================================
-
-def get_news_context(title: str) -> dict:
-    result = {"count": 0, "headlines": []}
-    try:
-        words = title.split()[:5]
-        query = "+".join(words)
-        r = requests.get(
-            f"https://news.google.com/rss/search?q={query}&hl=en&gl=US&ceid=US:en",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10
-        )
-        if r.status_code != 200:
-            return result
-
-        root    = ET.fromstring(r.content)
-        channel = root.find("channel")
-        if channel is None:
-            return result
-
-        now = datetime.now(timezone.utc)
-        count     = 0
-        headlines = []
-
-        for item in channel.findall("item"):
-            try:
-                pub_date = item.findtext("pubDate", "")
-                if pub_date:
-                    from email.utils import parsedate_to_datetime
-                    pub_dt = parsedate_to_datetime(pub_date)
-                    if pub_dt.tzinfo is None:
-                        pub_dt = pub_dt.replace(tzinfo=timezone.utc)
-                    if (now - pub_dt).total_seconds() / 3600 <= 48:
-                        count += 1
-                        if len(headlines) < 2:
-                            h = item.findtext("title", "").split(" - ")[0][:80]
-                            if h:
-                                headlines.append(h)
-            except Exception:
-                continue
-
-        result["count"]     = count
-        result["headlines"] = headlines
-
-    except Exception as e:
-        print(f"  [News Error] {e}")
-
-    return result
-
-# ============================================================
-# 🌐 ВНЕШНИЕ ОЦЕНКИ
-# ============================================================
-
-def get_metaculus_price(title: str) -> float | None:
-    try:
-        r = requests.get(
-            "https://www.metaculus.com/api2/questions/",
-            params={"search": title[:60], "status": "open", "limit": 3},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10
-        )
-        if r.status_code == 200:
-            for q in r.json().get("results", []):
-                cp = q.get("community_prediction", {})
-                if cp:
-                    p = cp.get("full", {}).get("q2")
-                    if p and 0 < p < 1:
-                        return float(p)
-    except Exception:
-        pass
-    return None
-
-def get_manifold_price(title: str) -> float | None:
-    try:
-        r = requests.get(
-            "https://api.manifold.markets/v0/search-markets",
-            params={"term": title[:50], "limit": 3},
-            timeout=10
-        )
-        if r.status_code == 200:
-            for m in r.json():
-                prob = m.get("probability")
-                if prob and 0 < prob < 1:
-                    return float(prob)
-    except Exception:
-        pass
-    return None
-
-# ============================================================
-# 📊 ПАРСИНГ
-# ============================================================
-
-def get_active_markets(limit: int = 150) -> list:
+def get_active_markets(limit: int = 200) -> list:
     try:
         params = {
             "active": "true", "closed": "false",
             "archived": "false", "limit": limit,
-            "order": "volume24hr", "ascending": "false",
+            "order": "liquidity", "ascending": "false",
         }
         r = requests.get(f"{GAMMA_API}/markets", params=params, timeout=15)
         if r.status_code == 200:
@@ -613,107 +563,18 @@ def get_clob_price(token_id: str) -> float | None:
             timeout=10
         )
         if r.status_code == 200:
-            return float(r.json().get("price", 0))
+            p = float(r.json().get("price", 0))
+            return p if p > 0 else None
     except Exception:
         pass
     return None
 
 def get_market_url(market: dict) -> str:
-    slug      = market.get("slug", "")
-    market_id = market.get("id", "")
+    slug = market.get("slug", "")
+    mid  = market.get("id", "")
     if slug:
         return f"https://polymarket.com/event/{slug}"
-    elif market_id:
-        return f"https://polymarket.com/market/{market_id}"
-    return "https://polymarket.com"
-
-def estimate_fair_probability(title: str, market: dict, category: str) -> tuple:
-    if category in ("🗳️ Политика", "🌍 Геополитика"):
-        p = get_metaculus_price(title)
-        if p:
-            return p, "Metaculus"
-        p = get_manifold_price(title)
-        if p:
-            return p, "Manifold"
-    try:
-        op = market.get("outcomePrices", "[]")
-        if isinstance(op, str):
-            op = json.loads(op)
-        if len(op) >= 2:
-            p_yes, p_no = float(op[0]), float(op[1])
-            total = p_yes + p_no
-            if total > 0:
-                return p_yes / total, "market_math"
-    except Exception:
-        pass
-    return None, ""
-
-# ============================================================
-# 🧠 УМНЫЙ СКОРИНГ v5
-# ============================================================
-
-def smart_score(result: dict) -> float:
-    score = 0.0
-
-    score += result["edge"] * 100 * 2.0
-
-    if result["source"] in ("Metaculus", "Manifold"):
-        score += 15.0
-
-    p = result["market_price"]
-    if 0.20 <= p <= 0.45:
-        score += 20.0
-    elif 0.45 < p <= 0.60:
-        score += 5.0
-
-    if result["liquidity"] > 50_000:
-        score += 10.0
-    elif result["liquidity"] > 10_000:
-        score += 5.0
-
-    days = result.get("days_left")
-    if days and 7 <= days <= 90:
-        score += 10.0
-    elif days and days <= 2:
-        score -= 15.0
-
-    trend  = result.get("trend_data", {})
-    signal = trend.get("signal", "neutral")
-    if signal == "opportunity":
-        score += 20.0
-    elif signal == "caution":
-        score -= 10.0
-
-    trades = trend.get("trades_24h", 0)
-    if trades >= 50:
-        score += 15.0
-    elif trades >= 20:
-        score += 8.0
-    elif trades >= 5:
-        score += 3.0
-    elif trades == 0:
-        score -= 10.0
-
-    news = result.get("news_data", {})
-    nc   = news.get("count", 0)
-    if nc >= 10:
-        score += 20.0
-    elif nc >= 5:
-        score += 10.0
-    elif nc >= 2:
-        score += 5.0
-
-    # 📈 СПАЙК ОБЪЁМА — кто-то крупный входит прямо сейчас
-    spike = result.get("volume_spike", {})
-    if spike.get("spike"):
-        ratio = spike.get("ratio", 1)
-        score += min(ratio * 5, 25)  # максимум +25
-
-    return round(score, 1)
-
-# ============================================================
-# 🔬 АНАЛИЗ РЫНКА
-# ============================================================
+    return f"https://polymarket.com/market/{mid}"
 
 def analyze_market(market: dict) -> dict | None:
     try:
@@ -722,11 +583,12 @@ def analyze_market(market: dict) -> dict | None:
         liquidity = float(market.get("liquidity", 0) or 0)
         market_id = str(market.get("id", ""))
 
-        category = get_category(title)
-        if not category:
+        # Спорт исключаем сразу
+        t = title.lower()
+        if any(kw in t for kw in SPORTS_KEYWORDS):
             return None
 
-        if volume < MIN_VOLUME or liquidity < 500:
+        if volume < MIN_VOLUME or liquidity < MIN_LIQUIDITY:
             return None
 
         token_id = None
@@ -738,6 +600,7 @@ def analyze_market(market: dict) -> dict | None:
         if not token_id:
             return None
 
+        # Дней до закрытия
         days_left = None
         end_date  = market.get("endDate", "")
         if end_date:
@@ -747,44 +610,75 @@ def analyze_market(market: dict) -> dict | None:
             except Exception:
                 pass
 
-        if days_left is not None and days_left < MIN_DAYS_LEFT:
+        if days_left is None or not (MIN_DAYS <= days_left <= MAX_DAYS):
             return None
 
-        market_price = get_clob_price(token_id)
-        if not market_price or not (MIN_PROB <= market_price <= MAX_PRICE):
+        price = get_clob_price(token_id)
+        if not price or not (MIN_PRICE <= price <= MAX_PRICE):
             return None
 
-        fair_prob, source = estimate_fair_probability(title, market, category)
-        if fair_prob is None:
+        # Детектор уже случившихся событий
+        detection   = detect_already_happened(title, market)
+        confidence  = detection["confidence"]
+        det_type    = detection["type"]
+
+        # Пропускаем если уверенность слишком низкая
+        if confidence < 20:
             return None
 
-        edge = fair_prob - market_price
-        if edge < MIN_EDGE:
-            return None
+        # Проверка новостями
+        news = check_news_confirmation(title)
+        if news["confirmed"]:
+            confidence = min(confidence + 25, 99)
 
-        trend_data   = get_price_trend(market_id)
-        news_data    = get_news_context(title)
-        volume_spike = get_volume_spike(market_id, volume)
+        roi = ((1.0 - price) / price) * 100
 
-        result = {
-            "title":        title,
-            "link":         get_market_url(market),
-            "category":     category,
-            "market_id":    market_id,
-            "market_price": market_price,
-            "fair_prob":    fair_prob,
-            "source":       source,
-            "edge":         edge,
-            "roi":          (1.0 - market_price) / market_price * 100,
-            "volume":       volume,
-            "liquidity":    liquidity,
-            "days_left":    days_left,
-            "trend_data":   trend_data,
-            "news_data":    news_data,
-            "volume_spike": volume_spike,
+        # Скор надёжности
+        reliability = 0
+        if det_type == "crypto_verified":
+            reliability += 50
+        elif det_type == "past_pattern":
+            reliability += 25
+        elif det_type == "predictable":
+            reliability += 15
+
+        if news["confirmed"]:
+            reliability += 30
+        elif news["count"] > 5:
+            reliability += 10
+
+        if volume > 100_000:
+            reliability += 20
+        elif volume > 50_000:
+            reliability += 12
+        elif volume > 10_000:
+            reliability += 5
+
+        if liquidity > 50_000:
+            reliability += 15
+        elif liquidity > 10_000:
+            reliability += 8
+
+        if 3 <= days_left <= 14:
+            reliability += 15
+        elif days_left <= 2:
+            reliability += 5
+
+        return {
+            "title":       title,
+            "link":        get_market_url(market),
+            "market_id":   market_id,
+            "price":       price,
+            "roi":         roi,
+            "volume":      volume,
+            "liquidity":   liquidity,
+            "days_left":   days_left,
+            "confidence":  confidence,
+            "reliability": min(reliability, 99),
+            "det_type":    det_type,
+            "det_reason":  detection["reason"],
+            "news":        news,
         }
-        result["score"] = smart_score(result)
-        return result
 
     except Exception as e:
         print(f"  [Analyze Error] {e}")
@@ -795,96 +689,60 @@ def analyze_market(market: dict) -> dict | None:
 # ============================================================
 
 def format_alert(r: dict) -> str:
-    edge_pct = r["edge"] * 100
-    score    = r.get("score", 0)
+    price = r["price"]
+    roi   = r["roi"]
+    rel   = r["reliability"]
+    conf  = r["confidence"]
 
-    if score >= 70:
-        quality = "🔥 СИЛЬНЫЙ СИГНАЛ"
-    elif score >= 45:
-        quality = "⚡ ХОРОШИЙ СИГНАЛ"
+    # Тип сигнала
+    if r["det_type"] == "crypto_verified":
+        sig_type = "🔵 КРИПТО — ПРОВЕРЕНО В РЕАЛЬНОМ ВРЕМЕНИ"
+    elif r["news"]["confirmed"]:
+        sig_type = "🟢 ПОДТВЕРЖДЕНО НОВОСТЯМИ"
+    elif conf >= 60:
+        sig_type = "🟡 ВЫСОКАЯ ВЕРОЯТНОСТЬ"
     else:
-        quality = "💡 СИГНАЛ"
+        sig_type = "🟠 УМЕРЕННАЯ ВЕРОЯТНОСТЬ"
 
-    days_str = f"{r['days_left']} дн." if r["days_left"] is not None else "—"
-
-    source_labels = {
-        "Metaculus":   "📊 Metaculus",
-        "Manifold":    "📊 Manifold",
-        "market_math": "📐 Математика рынка",
-    }
-    source_str = source_labels.get(r["source"], r["source"])
-
-    trend      = r.get("trend_data", {})
-    change_pct = trend.get("change_pct", 0)
-    trades_24h = trend.get("trades_24h", 0)
-    signal     = trend.get("signal", "neutral")
-
-    if signal == "opportunity":
-        trend_str = f"📉 {change_pct:+.1f}% за 24ч — <b>рынок падает, возможность!</b>"
-    elif signal == "caution":
-        trend_str = f"📈 {change_pct:+.1f}% за 24ч — рынок растёт (осторожно)"
+    # Надёжность
+    if rel >= 75:
+        rel_str = f"🛡️ {rel}/100 — <b>очень надёжный</b>"
+    elif rel >= 50:
+        rel_str = f"🛡️ {rel}/100 — надёжный"
     else:
-        trend_str = f"➡️ {change_pct:+.1f}% за 24ч — стабильно"
+        rel_str = f"🛡️ {rel}/100 — умеренный"
 
-    if trades_24h >= 50:
-        activity_str = f"🔥 {trades_24h} сделок за 24ч"
-    elif trades_24h >= 20:
-        activity_str = f"⚡ {trades_24h} сделок за 24ч"
+    days_str = f"{r['days_left']} дн." if r["days_left"] > 0 else "сегодня"
+
+    # Рекомендация по ставке
+    if rel >= 75:
+        stake = "5–8% бюджета"
+    elif rel >= 50:
+        stake = "2–4% бюджета"
     else:
-        activity_str = f"💤 {trades_24h} сделок за 24ч"
+        stake = "1–2% бюджета"
 
-    # Спайк объёма
-    spike     = r.get("volume_spike", {})
-    spike_str = ""
-    if spike.get("spike"):
-        ratio     = spike.get("ratio", 1)
-        vol_1h    = spike.get("volume_1h", 0)
-        spike_str = f"\n📈 <b>СПАЙК ОБЪЁМА x{ratio}!</b> ${vol_1h:,.0f} за последний час"
+    # Новостное подтверждение
+    news_str = ""
+    if r["news"]["confirmed"] and r["news"]["headline"]:
+        news_str = f"\n📰 <i>«{r['news']['headline']}»</i>"
+    elif r["news"]["count"] > 0:
+        news_str = f"\n📰 {r['news']['count']} новостей по теме за 72ч"
 
-    news       = r.get("news_data", {})
-    news_count = news.get("count", 0)
-    headlines  = news.get("headlines", [])
-
-    if news_count >= 10:
-        news_str = f"🔴 {news_count} новостей за 48ч — <b>горячая тема!</b>"
-    elif news_count >= 5:
-        news_str = f"🟡 {news_count} новостей за 48ч"
-    elif news_count >= 2:
-        news_str = f"🟢 {news_count} новости за 48ч"
-    else:
-        news_str = "⚪ Новостей почти нет"
-
-    headlines_str = ""
-    if headlines:
-        headlines_str = "\n<i>» " + "</i>\n<i>» ".join(headlines) + "</i>"
-
-    tip = ""
-    if 0.20 <= r["market_price"] <= 0.40:
-        tip = "\n💎 <i>Золотая зона: низкая цена, высокий ROI</i>"
-
-    # Повторный сигнал?
-    key      = signal_key(r["title"])
-    repeat   = ""
-    if key in signal_memory:
-        prev_score = signal_memory[key].get("score", 0)
-        repeat     = f"\n🔄 <i>Повторный сигнал (скор вырос: {prev_score}→{score})</i>"
+    # Причина детекции
+    reason_str = f"\n🔍 <i>{r['det_reason']}</i>" if r["det_reason"] else ""
 
     return (
-        f"{quality}\n"
-        f"{r['category']} | Скор: <b>{score}</b>{repeat}\n\n"
+        f"{sig_type}\n\n"
         f"<b>{r['title']}</b>\n\n"
-        f"💰 Рыночная цена:  <b>{r['market_price']*100:.1f}%</b>\n"
-        f"🎯 Наша оценка:    <b>{r['fair_prob']*100:.1f}%</b>\n"
-        f"🔍 Источник:       {source_str}\n"
-        f"📈 Преимущество:  <b>+{edge_pct:.1f}%</b>\n"
-        f"💵 ROI при победе: <b>{r['roi']:.0f}%</b>{tip}\n\n"
-        f"── Анализ рынка ──\n"
-        f"{trend_str}\n"
-        f"{activity_str}{spike_str}\n"
-        f"{news_str}{headlines_str}\n\n"
+        f"💰 Цена входа:     <b>{price*100:.1f}¢</b>\n"
+        f"💵 ROI при победе: <b>+{roi:.1f}%</b>\n"
+        f"🎯 Уверенность:   <b>{conf}%</b>\n"
+        f"{rel_str}{reason_str}{news_str}\n\n"
         f"📊 Объём:       ${r['volume']:,.0f}\n"
         f"💧 Ликвидность: ${r['liquidity']:,.0f}\n"
         f"⏳ До закрытия: {days_str}\n\n"
+        f"💡 Рекомендуемая ставка: {stake}\n\n"
         f"🔗 <a href='{r['link']}'>Открыть на Polymarket</a>\n\n"
         f"⚠️ <i>Информационный алерт. Решение за тобой.</i>"
     )
@@ -901,33 +759,46 @@ def run_scan(label: str = "auto") -> int:
     for market in markets:
         result = analyze_market(market)
         if result:
-            key = f"{result['title']}_{result['market_price']:.3f}"
+            key = result["title"]
             if key not in seen:
                 found.append(result)
                 seen.add(key)
-        time.sleep(0.5)
+        time.sleep(0.4)
 
-    found.sort(key=lambda x: x["score"], reverse=True)
-    print(f"  [{label}] Найдено сигналов: {len(found)}")
+    # Сортируем: сначала крипто-верифицированные, потом по надёжности
+    found.sort(key=lambda x: (
+        x["det_type"] == "crypto_verified",
+        x["news"]["confirmed"],
+        x["reliability"]
+    ), reverse=True)
+
+    print(f"  [{label}] Найдено: {len(found)}")
 
     sent = 0
-    for result in found[:5]:
-        if not should_send_signal(result):
-            print(f"  ⏭️  Пропускаю (уже в памяти): {result['title'][:40]}")
+    for result in found[:10]:
+        if already_sent(result["title"], result["price"]):
+            print(f"  ⏭️  Уже в памяти: {result['title'][:40]}")
             continue
         if send_telegram(format_alert(result)):
-            remember_signal(result)
+            remember(result)
             sent += 1
             print(
-                f"  ✅ [{result['category']}] "
-                f"{result['title'][:40]}... "
-                f"score={result['score']} "
-                f"spike={result['volume_spike'].get('spike', False)}"
+                f"  ✅ {result['title'][:45]}... "
+                f"price={result['price']*100:.1f}¢ "
+                f"roi=+{result['roi']:.1f}% "
+                f"conf={result['confidence']}% "
+                f"type={result['det_type']}"
             )
-        time.sleep(2)
+        time.sleep(1.5)
 
     if label == "manual" and sent == 0:
-        send_telegram("😔 Новых сигналов нет. Все уже в памяти или рынок спокойный.")
+        send_telegram(
+            "😔 Новых сигналов нет.\n\n"
+            "Либо все уже в памяти,\n"
+            "либо нет рынков с достаточной уверенностью.\n\n"
+            f"Критерии: {MIN_PRICE*100:.0f}–{MAX_PRICE*100:.0f}¢, "
+            f"ликвидность ${MIN_LIQUIDITY:,.0f}+"
+        )
     return sent
 
 def manual_scan():
@@ -943,13 +814,9 @@ def scanner_loop():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Скан #{scan_count}")
         sent = run_scan("auto")
         alert_count += sent
-
-        # Каждые 10 сканов проверяем закрытые рынки
         if scan_count % 10 == 0:
-            print("  [Results] Проверяю закрытые рынки...")
             check_closed_markets()
-
-        print(f"  Всего алертов: {alert_count} | Следующий скан через {SCAN_INTERVAL//60} мин")
+        print(f"  Всего: {alert_count} алертов | Следующий через {SCAN_INTERVAL//60} мин")
         time.sleep(SCAN_INTERVAL)
 
 def polling_loop():
@@ -964,37 +831,32 @@ def polling_loop():
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("🤖 Polymarket Scanner Bot v5")
-    print(f"   Token:    {'✅ задан' if TELEGRAM_TOKEN else '❌ не задан'}")
-    print(f"   Chat ID:  {'✅ задан' if TELEGRAM_CHAT_ID else '❌ не задан'}")
-    print(f"   Edge:     {MIN_EDGE*100:.0f}%")
-    print(f"   Мин.шанс: {MIN_PROB*100:.0f}%")
+    print("🎯 Sure-Thing Bot v2")
+    print(f"   Token:    {'✅' if TELEGRAM_TOKEN else '❌'}")
+    print(f"   Chat ID:  {'✅' if TELEGRAM_CHAT_ID else '❌'}")
+    print(f"   Диапазон: {MIN_PRICE*100:.0f}–{MAX_PRICE*100:.0f}¢")
     print(f"   Интервал: {SCAN_INTERVAL//60} мин")
-    print(f"   Дайджест: {DIGEST_HOUR}:00 UTC")
     print("=" * 50)
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("\n❌ Задай переменные окружения:")
-        print("   TELEGRAM_TOKEN=твой_токен")
-        print("   TELEGRAM_CHAT_ID=твой_chat_id")
+        print("\n❌ Задай переменные окружения")
         exit(1)
 
     send_telegram(
-        "🚀 <b>Polymarket Scanner Bot v5!</b>\n\n"
-        "Категории: 🗳️ Политика | ₿ Крипто\n"
-        "🌍 Геополитика | 🤖 ИИ/Тех\n"
-        "⛔ Спорт исключён\n\n"
-        "Новое в v5:\n"
-        "💾 Память сигналов (без спама)\n"
-        "🏆 Результаты закрытых рынков\n"
-        "⏰ Дайджест каждый день в 9:00 UTC\n"
-        "📈 Детектор спайков объёма\n\n"
-        "Команды: /scan /status /results /digest"
+        "🎯 <b>Sure-Thing Bot v2 запущен!</b>\n\n"
+        "Ищу события которые <b>уже случились</b>\n"
+        "но рынок ещё не закрылся.\n\n"
+        "Приоритеты:\n"
+        "🔵 Крипто — проверяю цену в реальном времени\n"
+        "🟢 Подтверждено свежими новостями\n"
+        "🟡 Высокая вероятность по паттернам\n\n"
+        f"Диапазон: {MIN_PRICE*100:.0f}–{MAX_PRICE*100:.0f}¢\n\n"
+        "Команды: /scan /status /results /digest /calc"
     )
 
     t1 = threading.Thread(target=scanner_loop, daemon=True)
-    t2 = threading.Thread(target=polling_loop, daemon=True)
-    t3 = threading.Thread(target=digest_loop,  daemon=True)
+    t2 = threading.Thread(target=polling_loop,  daemon=True)
+    t3 = threading.Thread(target=digest_loop,   daemon=True)
     t1.start()
     t2.start()
     t3.start()
