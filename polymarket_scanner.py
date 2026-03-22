@@ -570,11 +570,26 @@ def get_clob_price(token_id: str) -> float | None:
     return None
 
 def get_market_url(market: dict) -> str:
+    """
+    Правильный URL на Polymarket.
+    Приоритет: groupSlug (event) → slug (market) → conditionId
+    """
+    # groupSlug — это slug события (работает всегда)
+    group_slug = market.get("groupSlug", "")
+    if group_slug:
+        return f"https://polymarket.com/event/{group_slug}"
+
+    # slug рынка — тоже работает через /event/
     slug = market.get("slug", "")
-    mid  = market.get("id", "")
     if slug:
         return f"https://polymarket.com/event/{slug}"
-    return f"https://polymarket.com/market/{mid}"
+
+    # conditionId — запасной вариант
+    condition_id = market.get("conditionId", "")
+    if condition_id:
+        return f"https://polymarket.com/market/{condition_id}"
+
+    return "https://polymarket.com"
 
 def analyze_market(market: dict) -> dict | None:
     try:
