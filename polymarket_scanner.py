@@ -32,7 +32,7 @@ RISK        = float(os.environ.get("RISK", "0.02"))    # 2% риск на сде
 SL_PCT      = float(os.environ.get("SL_PCT", "0.02"))  # 2% стоп-лосс
 TP_PCT      = float(os.environ.get("TP_PCT", "0.06"))  # 6% тейк-профит
 
-SYMBOLS       = ["BTCUSDT", "ETHUSDT"]
+SYMBOLS       = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "AVAXUSDT", "DOGEUSDT", "ADAUSDT"]
 SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "60"))  # каждую минуту
 BYBIT_BASE    = "https://api.bybit.com"
 
