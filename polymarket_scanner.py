@@ -249,8 +249,10 @@ def get_klines(symbol: str, interval: str, limit: int = 60) -> list:
         if r.status_code == 200:
             data = r.json().get("result", {}).get("list", [])
             return list(reversed(data))  # от старых к новым
-    except Exception:
-        pass
+        else:
+            print(f"  [Klines] {symbol} {interval}m: HTTP {r.status_code}")
+    except Exception as e:
+        print(f"  [Klines Error] {symbol} {interval}m: {e}")
     return []
 
 # ============================================================
@@ -304,12 +306,24 @@ def calc_supertrend(highs: list, lows: list, closes: list,
         return upper, -1
     return (lower, 1) if prev > hl2 else (upper, -1)
 
+# Кэш HTF трендов — обновляем раз в 15 минут чтобы не спамить API
+_htf_cache = {}
+_htf_cache_time = {}
+HTF_CACHE_SECONDS = 900  # 15 минут
+
 def get_htf_trend(symbol: str) -> dict:
     """
     Получаем тренд с 4H и 1H таймфреймов.
-    Точная копия логики из рабочего бэктестера v3:
-    Supertrend на 4H + EMA(20) перезаписывает результат для стабильности.
+    Кэшируем на 15 минут — 4H тренд не меняется каждую минуту.
     """
+    global _htf_cache, _htf_cache_time
+    now = time.time()
+
+    # Возвращаем кэш если не устарел
+    if symbol in _htf_cache:
+        if now - _htf_cache_time.get(symbol, 0) < HTF_CACHE_SECONDS:
+            return _htf_cache[symbol]
+
     result = {"trend_4h": 0, "trend_1h": 0}
     try:
         # 4H тренд — берём 30 свечей как в бэктестере
@@ -318,17 +332,12 @@ def get_htf_trend(symbol: str) -> dict:
             c4h = [float(k[4]) for k in k4h]
             h4h = [float(k[2]) for k in k4h]
             l4h = [float(k[3]) for k in k4h]
-            # Supertrend
             _, d4h = calc_supertrend(h4h, l4h, c4h)
             if d4h:
                 result["trend_4h"] = d4h
-            # EMA(20) перезаписывает — даёт стабильный тренд
             ema_4h = calc_ema(c4h, 20)
             if ema_4h and len(ema_4h) >= 2:
-                if ema_4h[-1] > ema_4h[-2]:
-                    result["trend_4h"] = 1
-                elif ema_4h[-1] < ema_4h[-2]:
-                    result["trend_4h"] = -1
+                result["trend_4h"] = 1 if ema_4h[-1] > ema_4h[-2] else -1
 
         # 1H тренд — только Supertrend как в бэктестере
         k1h = get_klines(symbol, "60", 30)
@@ -340,8 +349,16 @@ def get_htf_trend(symbol: str) -> dict:
             if d1h:
                 result["trend_1h"] = d1h
 
+        # Логируем тренд при изменении
+        prev = _htf_cache.get(symbol, {})
+        if prev.get("trend_4h") != result["trend_4h"] or prev.get("trend_1h") != result["trend_1h"]:
+            print(f"  [HTF {symbol}] 4H={result['trend_4h']:+d} 1H={result['trend_1h']:+d}")
+
     except Exception as e:
-        print(f"  [HTF Error] {e}")
+        print(f"  [HTF Error] {symbol}: {e}")
+
+    _htf_cache[symbol]      = result
+    _htf_cache_time[symbol] = now
     return result
 
 # ============================================================
