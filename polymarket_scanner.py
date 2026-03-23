@@ -305,28 +305,41 @@ def calc_supertrend(highs: list, lows: list, closes: list,
     return (lower, 1) if prev > hl2 else (upper, -1)
 
 def get_htf_trend(symbol: str) -> dict:
-    """Получаем тренд с 4H и 1H таймфреймов"""
+    """
+    Получаем тренд с 4H и 1H таймфреймов.
+    Точная копия логики из рабочего бэктестера v3:
+    Supertrend на 4H + EMA(20) перезаписывает результат для стабильности.
+    """
     result = {"trend_4h": 0, "trend_1h": 0}
     try:
-        # 4H тренд
+        # 4H тренд — берём 30 свечей как в бэктестере
         k4h = get_klines(symbol, "240", 30)
-        if len(k4h) >= 15:
+        if len(k4h) >= 20:
             c4h = [float(k[4]) for k in k4h]
             h4h = [float(k[2]) for k in k4h]
             l4h = [float(k[3]) for k in k4h]
+            # Supertrend
             _, d4h = calc_supertrend(h4h, l4h, c4h)
             if d4h:
                 result["trend_4h"] = d4h
+            # EMA(20) перезаписывает — даёт стабильный тренд
+            ema_4h = calc_ema(c4h, 20)
+            if ema_4h and len(ema_4h) >= 2:
+                if ema_4h[-1] > ema_4h[-2]:
+                    result["trend_4h"] = 1
+                elif ema_4h[-1] < ema_4h[-2]:
+                    result["trend_4h"] = -1
 
-        # 1H тренд
+        # 1H тренд — только Supertrend как в бэктестере
         k1h = get_klines(symbol, "60", 30)
-        if len(k1h) >= 15:
+        if len(k1h) >= 20:
             c1h = [float(k[4]) for k in k1h]
             h1h = [float(k[2]) for k in k1h]
             l1h = [float(k[3]) for k in k1h]
             _, d1h = calc_supertrend(h1h, l1h, c1h)
             if d1h:
                 result["trend_1h"] = d1h
+
     except Exception as e:
         print(f"  [HTF Error] {e}")
     return result
